@@ -1,0 +1,18 @@
+# Local builds and temporary test folders
+dist/
+build/
+.test-*/
+.test-*.ps1
+
+# Editor and Windows files
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
+
+# Runtime state must stay outside the repository
+folders.json
+*.tmp
+*.log
