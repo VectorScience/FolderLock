@@ -14,5 +14,24 @@ Desktop.ini
 
 # Runtime state must stay outside the repository
 folders.json
+rclone.exe
+rclone-README.txt
 *.tmp
 *.log
+
+# Unpacked distributions and private vault/runtime data
+/packages/*/
+*.folderlock/
+.folderlock/
+write-cache/
+open-requests/
+vaults.json
+session.json
+portal.json
+vault.json
+.env
+.env.*
+*.pfx
+*.p12
+*.pem
+*.key

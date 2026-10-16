@@ -4,30 +4,53 @@ using System.IO;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Windows.Forms;
+using System.Threading;
+using System.Security.Principal;
+using System.Text;
 
 [assembly: AssemblyTitle("FolderLock")]
-[assembly: AssemblyDescription("Windows folder access lock")]
+[assembly: AssemblyDescription("Windows folder encryption")]
 [assembly: AssemblyCompany("VectorScience")]
 [assembly: AssemblyProduct("FolderLock")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("2.4.2.0")]
+[assembly: AssemblyFileVersion("2.4.2.0")]
 
 internal static class Launcher
 {
     [STAThread]
-    private static int Main()
+    private static int Main(string[] args)
     {
         try
         {
             string appDirectory = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "FolderLock", "app");
+                "FolderLock", "app-v2");
             Directory.CreateDirectory(appDirectory);
+            string openPath = "";
+            bool restore = args.Length == 1 && args[0] == "--restore-entries";
+            if (args.Length != 0 && !restore) {
+                if (args.Length != 2 || (args[0] != "--open" && args[0] != "--encrypt")) throw new ArgumentException("用法：FolderLock.exe --open 或 --encrypt 文件夹路径");
+                openPath = Path.GetFullPath(args[1]).TrimEnd('\\');
+            }
+            try {
+                using (var running = Mutex.OpenExisting("Local\\FolderLock2UI-" + WindowsIdentity.GetCurrent().User.Value)) {
+                    if (restore) return 0;
+                    string requests = Path.Combine(appDirectory, "open-requests"); Directory.CreateDirectory(requests);
+                    string request = Path.Combine(requests, Guid.NewGuid().ToString("N") + (args.Length == 2 && args[0] == "--encrypt" ? ".encrypt.request" : ".request"));
+                    File.WriteAllText(request + ".new", openPath, new UTF8Encoding(false)); File.Move(request + ".new", request);
+                    return 0;
+                }
+            } catch (WaitHandleCannotBeOpenedException) { }
 
             string scriptPath = Path.Combine(appDirectory, "FolderLock.ps1");
             string iconPath = Path.Combine(appDirectory, "FolderLock.ico");
             ExtractResource("FolderLock.ps1", scriptPath);
             ExtractResource("FolderLock.ico", iconPath);
+            ExtractResource("VaultEngine.cs", Path.Combine(appDirectory, "VaultEngine.cs"));
+            ExtractResource("Legacy-FolderLock.ps1", Path.Combine(appDirectory, "Legacy-FolderLock.ps1"));
+            ExtractResource("Prepare-Dependencies.ps1", Path.Combine(appDirectory, "Prepare-Dependencies.ps1"));
+            string rclone = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "rclone.exe");
+            if (!File.Exists(rclone)) throw new FileNotFoundException("请解压完整 ZIP，FolderLock.exe 同级需要 rclone.exe。", rclone);
 
             string powershell = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.Windows),
@@ -37,7 +60,7 @@ internal static class Launcher
 
             var process = new ProcessStartInfo(powershell)
             {
-                Arguments = "-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + scriptPath + "\"",
+                Arguments = "-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File " + Quote(scriptPath) + " -RclonePath " + Quote(rclone) + " -LauncherPath " + Quote(Assembly.GetExecutingAssembly().Location) + (restore ? " -RestoreEntries" : openPath.Length == 0 ? "" : (args[0] == "--encrypt" ? " -EncryptPath " : " -OpenPath ") + Quote(openPath)),
                 WorkingDirectory = appDirectory,
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -48,10 +71,20 @@ internal static class Launcher
         }
         catch (Exception error)
         {
+            if (args.Length == 1 && args[0] == "--restore-entries") return 1; // Startup recovery stays silent.
             MessageBox.Show("FolderLock 启动失败：\n" + error.Message,
                 "FolderLock", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
+    }
+
+    private static string Quote(string value) {
+        var result = new StringBuilder("\""); int slashes = 0;
+        foreach (char c in value) {
+            if (c == '\\') { slashes++; continue; }
+            result.Append('\\', c == '"' ? slashes * 2 + 1 : slashes); result.Append(c); slashes = 0;
+        }
+        result.Append('\\', slashes * 2); return result.Append('"').ToString();
     }
 
     private static void ExtractResource(string name, string destination)

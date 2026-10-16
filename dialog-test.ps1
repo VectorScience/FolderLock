@@ -1,7 +1,5 @@
 ﻿$ErrorActionPreference = 'Stop'
-$source = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'FolderLock.ps1'))
-$prefix = $source.Substring(0, $source.IndexOf("`nif (`$OpenId) {"))
-Invoke-Expression $prefix
+. (Join-Path $PSScriptRoot 'FolderLock.ps1') -LibraryOnly
 $script:stage = 0
 $script:ValidationErrors = @()
 function Show-Error([string]$message) { $script:ValidationErrors += $message }

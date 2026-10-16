@@ -1,635 +1,342 @@
-﻿param(
-    [string]$OpenId
-)
-
-# FolderLock is an ACL-based privacy tool. It does not encrypt file contents.
+﻿param([switch]$LibraryOnly, [string]$RclonePath, [string]$OpenPath, [string]$LauncherPath, [switch]$RestoreEntries, [string]$EncryptPath)
+$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
-
-$ErrorActionPreference = 'Stop'
-$script:DataDir = Join-Path $env:LOCALAPPDATA 'FolderLock'
-$script:DataFile = Join-Path $script:DataDir 'folders.json'
-$script:MySid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-$script:Mutex = New-Object System.Threading.Mutex($false, ('Local\FolderLock-' + $script:MySid.Replace('-', '_')))
-$script:Managed = @{}
-$script:LastWindowCheck = Get-Date
-
-function Show-Error([string]$message) {
-    [void][System.Windows.Forms.MessageBox]::Show($message, 'FolderLock', 'OK', 'Error')
-}
-
-function Invoke-State([scriptblock]$action) {
-    $acquired = $false
-    try {
-        try { $acquired = $script:Mutex.WaitOne(10000) }
-        catch [System.Threading.AbandonedMutexException] { $acquired = $true }
-        if (-not $acquired) { throw '另一个 FolderLock 操作正在进行，请稍后重试。' }
-        if (-not (Test-Path -LiteralPath $script:DataDir)) {
-            [void](New-Item -ItemType Directory -Path $script:DataDir -Force)
-        }
-        $entries = @()
-        $config = $null
-        if (Test-Path -LiteralPath $script:DataFile) {
-            $raw = Get-Content -LiteralPath $script:DataFile -Raw -Encoding UTF8
-            if ($raw.Trim()) {
-                $document = ConvertFrom-Json -InputObject $raw
-                $entries = @($document.entries)
-                $config = $document.config
-            }
-        }
-        $result = & $action $entries $config
-        if ($null -ne $result -and $result.Save) {
-            if ($result.ContainsKey('Config')) { $config = $result.Config }
-            $json = ConvertTo-Json -InputObject @{ version = 2; config = $config; entries = @($result.Entries) } -Depth 8
-            $temp = Join-Path $script:DataDir ([guid]::NewGuid().ToString('N') + '.tmp')
-            try {
-                [System.IO.File]::WriteAllText($temp, $json, [System.Text.UTF8Encoding]::new($false))
-                Move-Item -LiteralPath $temp -Destination $script:DataFile -Force
-            } finally { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force } }
-        }
-        return $result
-    } finally { if ($acquired) { $script:Mutex.ReleaseMutex() } }
-}
-
-function Get-Entries { return @( (Invoke-State { param($items) @{ Save = $false; Entries = $items } }).Entries ) }
-function Get-Config { return (Invoke-State { param($items, $config) @{ Save = $false; Entries = $items; Config = $config } }).Config }
-
-function New-PasswordRecord([string]$password) {
-    $salt = New-Object byte[] 16
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $rng.GetBytes($salt) } finally { $rng.Dispose() }
-    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($password, $salt, 310000, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
-    try { $hash = $kdf.GetBytes(32) } finally { $kdf.Dispose() }
-    return @{ salt = [Convert]::ToBase64String($salt); hash = [Convert]::ToBase64String($hash); iterations = 310000 }
-}
-
-function Test-Password([string]$password, $entry) {
-    $salt = [Convert]::FromBase64String($entry.salt)
-    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($password, $salt, [int]$entry.iterations, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
-    try { $actual = $kdf.GetBytes(32) } finally { $kdf.Dispose() }
-    $expected = [Convert]::FromBase64String($entry.hash)
-    if ($actual.Length -ne $expected.Length) { return $false }
-    $difference = 0
-    for ($i = 0; $i -lt $actual.Length; $i++) { $difference = $difference -bor ($actual[$i] -bxor $expected[$i]) }
-    return ($difference -eq 0)
-}
-
-function Initialize-GlobalConfig([string]$newPassword, [hashtable]$oldPasswords = @{}) {
-    Invoke-State {
-        param($items, $config)
-        if ($config) { throw '统一密码已经设置。' }
-        foreach ($entry in $items) {
-            if (-not $oldPasswords.ContainsKey($entry.id) -or -not (Test-Password $oldPasswords[$entry.id] $entry)) {
-                throw "旧密码验证失败：$($entry.path)"
-            }
-        }
-        $record = New-PasswordRecord $newPassword
-        $first = @($items)[0]
-        $settings = [pscustomobject]@{
-            salt = $record.salt; hash = $record.hash; iterations = $record.iterations
-            lockOnClose = $(if ($first) { [bool]$first.lockOnClose } else { $true })
-            lockOnSession = $(if ($first) { [bool]$first.lockOnSession } else { $true })
-            lockOnSleep = $(if ($first) { [bool]$first.lockOnSleep } else { $true })
-            minutes = $(if ($first) { [int]$first.minutes } else { 0 })
-        }
-        foreach ($entry in $items) {
-            foreach ($name in @('salt', 'hash', 'iterations', 'lockOnClose', 'lockOnSession', 'lockOnSleep', 'minutes')) {
-                $entry.PSObject.Properties.Remove($name)
-            }
-        }
-        @{ Save = $true; Entries = $items; Config = $settings }
-    } | Out-Null
-}
-
-function Ensure-GlobalConfig {
-    if (Get-Config) { return $true }
-    $items = Get-Entries
-    $oldPasswords = @{}
-    if ($items.Count) {
-        [void][System.Windows.Forms.MessageBox]::Show('检测到旧版按文件夹设置的密码。请依次输入每个旧密码，然后设置统一密码。', 'FolderLock')
-        foreach ($entry in $items) {
-            while ($true) {
-                $old = Read-Password "旧密码：$($entry.path)"
-                if ($null -eq $old) { return $false }
-                if (Test-Password $old $entry) { $oldPasswords[$entry.id] = $old; break }
-                Show-Error '密码错误，请重试。'
-            }
-        }
+if (-not ('FolderLock.VaultEngine' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'VaultEngine.cs') -ReferencedAssemblies System.Web.Extensions,System.Core }
+if (-not $RclonePath) {
+    foreach ($candidate in @((Join-Path $PSScriptRoot 'rclone.exe'), (Join-Path $PSScriptRoot 'build\tools\rclone.exe'))) {
+        if (Test-Path -LiteralPath $candidate) { $RclonePath = $candidate; break }
     }
-    $newPassword = Read-Password '首次设置统一密码' $true
-    if ($null -eq $newPassword) { return $false }
-    Initialize-GlobalConfig $newPassword $oldPasswords
-    return $true
 }
-
+function Show-Error([string]$message) { [void][System.Windows.Forms.MessageBox]::Show($message, 'FolderLock', 'OK', 'Error') }
 function Read-Password([string]$title, [bool]$confirm = $false) {
     $dialog = New-Object System.Windows.Forms.Form
-    $dialog.Text = $title
-    $dialog.Size = New-Object System.Drawing.Size(380, $(if ($confirm) { 190 } else { 145 }))
-    $dialog.StartPosition = 'CenterScreen'
-    $dialog.FormBorderStyle = 'FixedDialog'
-    $dialog.MaximizeBox = $false
-    $dialog.MinimizeBox = $false
+    if($form -and $form.Icon){$dialog.Icon=$form.Icon}
+    $dialog.Text = $title; $dialog.ClientSize = New-Object System.Drawing.Size(390, $(if ($confirm) { 190 } else { 125 }))
+    $dialog.StartPosition = 'CenterParent'; $dialog.FormBorderStyle = 'FixedDialog'; $dialog.MaximizeBox = $false; $dialog.MinimizeBox = $false
     $label = New-Object System.Windows.Forms.Label
-    $label.Text = '密码'
-    $label.Location = New-Object System.Drawing.Point(16, 16)
-    $label.AutoSize = $true
-    $dialog.Controls.Add($label)
+    $label.Text = '密码（至少 8 个字符）'; $label.SetBounds(16, 12, 350, 22); $dialog.Controls.Add($label)
     $first = New-Object System.Windows.Forms.TextBox
-    $first.Location = New-Object System.Drawing.Point(16, 37)
-    $first.Width = 330
-    $first.UseSystemPasswordChar = $true
-    $dialog.Controls.Add($first)
+    $first.UseSystemPasswordChar = $true; $first.SetBounds(16, 36, 355, 26); $dialog.Controls.Add($first)
+    $again = New-Object System.Windows.Forms.TextBox
     if ($confirm) {
-        $again = New-Object System.Windows.Forms.TextBox
-        $again.Location = New-Object System.Drawing.Point(16, 79)
-        $again.Width = 330
-        $again.UseSystemPasswordChar = $true
-        $dialog.Controls.Add($again)
-        $againLabel = New-Object System.Windows.Forms.Label
-        $againLabel.Text = '再次输入'
-        $againLabel.Location = New-Object System.Drawing.Point(16, 62)
-        $againLabel.AutoSize = $true
-        $dialog.Controls.Add($againLabel)
+        $label2 = New-Object System.Windows.Forms.Label
+        $label2.Text = '再次输入密码'; $label2.SetBounds(16, 69, 350, 22); $dialog.Controls.Add($label2)
+        $again.UseSystemPasswordChar = $true; $again.SetBounds(16, 93, 355, 26); $dialog.Controls.Add($again)
     }
     $ok = New-Object System.Windows.Forms.Button
-    $ok.Text = '确定'
-    $ok.Location = New-Object System.Drawing.Point(190, $(if ($confirm) { 112 } else { 73 }))
-    $dialog.Controls.Add($ok)
+    $ok.Text = '确定'; $ok.SetBounds(195, $(if ($confirm) { 144 } else { 82 }), 85, 30); $dialog.Controls.Add($ok)
     $cancel = New-Object System.Windows.Forms.Button
-    $cancel.Text = '取消'
-    $cancel.DialogResult = 'Cancel'
-    $cancel.Location = New-Object System.Drawing.Point(271, $(if ($confirm) { 112 } else { 73 }))
-    $dialog.Controls.Add($cancel)
+    $cancel.Text = '取消'; $cancel.DialogResult = 'Cancel'; $cancel.SetBounds(286, $ok.Top, 85, 30); $dialog.Controls.Add($cancel)
+    $dialog.AcceptButton = $ok; $dialog.CancelButton = $cancel
     $ok.Add_Click(({
-        if ($confirm -and $first.Text -ne $again.Text) {
-            Show-Error '两次输入的密码不一致。'
-            $again.Focus()
-            return
-        }
-        if ($confirm -and $first.Text.Length -lt 8) {
-            Show-Error '密码至少需要 8 个字符。'
-            $first.Focus()
-            return
-        }
-        $dialog.DialogResult = 'OK'
-        $dialog.Close()
+        if ($first.Text.Length -lt 8) { Show-Error '密码至少需要 8 个字符。'; return }
+        if ($confirm -and $first.Text -cne $again.Text) { Show-Error '两次输入的密码不一致。'; return }
+        $dialog.DialogResult = 'OK'; $dialog.Close()
     }).GetNewClosure())
-    if ($confirm) {
-        $first.Add_KeyDown(({
-            param($sender, $eventArgs)
-            if ($eventArgs.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
-                $eventArgs.SuppressKeyPress = $true
-                $again.Focus()
-            }
-        }).GetNewClosure())
-        $again.Add_Enter(({ $dialog.AcceptButton = $ok }).GetNewClosure())
-        $again.Add_Leave(({ $dialog.AcceptButton = $null }).GetNewClosure())
-        $dialog.AcceptButton = $null
-    } else {
-        $dialog.AcceptButton = $ok
-    }
-    $dialog.CancelButton = $cancel
-    $dialog.Add_Shown(({ $first.Focus() }).GetNewClosure())
+    try { if ($dialog.ShowDialog() -eq 'OK') { return $first.Text }; return $null }
+    finally { $first.Clear(); $again.Clear(); $dialog.Dispose() }
+}
+function Test-WinFsp { return (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp') -or (Test-Path 'HKLM:\SOFTWARE\WinFsp') }
+function Register-FolderContextMenu([string]$launcher, [string]$registryPath='Software\Classes\Directory\shell\FolderLock.Encrypt') {
+    if(-not $launcher -or -not(Test-Path -LiteralPath $launcher)){throw '找不到 FolderLock.exe，请完整解压后运行。'}
+    $quoted=[FolderLock.VaultEngine]::Quote([IO.Path]::GetFullPath($launcher))
+    $key=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($registryPath)
     try {
-        if ($dialog.ShowDialog() -ne 'OK') { return $null }
-        return $first.Text
-    } finally { $dialog.Dispose() }
+        $key.SetValue('', '使用 FolderLock 加密此文件夹')
+        $brandIcon=Join-Path (Split-Path $launcher) 'FolderLock-brand-v1.ico'
+        $key.SetValue('Icon', $(if(Test-Path -LiteralPath $brandIcon){[FolderLock.VaultEngine]::Quote($brandIcon)+',0'}else{$quoted+',0'}))
+        $key.SetValue('MultiSelectModel', 'Single')
+        $command=$key.CreateSubKey('command')
+        try {$command.SetValue('', $quoted+' --encrypt "%1"')} finally {$command.Dispose()}
+    } finally {$key.Dispose()}
 }
-
-function Assert-SafePath([string]$path, $entries) {
-    $path = [System.IO.Path]::GetFullPath($path).TrimEnd('\')
-    if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw '文件夹不存在。' }
-    if ($path.StartsWith('\\')) { throw '暂不支持网络文件夹。' }
-    if ($path -eq [System.IO.Path]::GetPathRoot($path).TrimEnd('\')) { throw '不能锁定磁盘根目录。' }
-    $item = Get-Item -LiteralPath $path -Force
-    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw '暂不支持符号链接或联接点。' }
-    $blocked = @($env:WINDIR, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:USERPROFILE, $env:LOCALAPPDATA, $env:APPDATA, $PSScriptRoot) | Where-Object { $_ }
-    foreach ($base in $blocked) {
-        $base = [System.IO.Path]::GetFullPath($base).TrimEnd('\')
-        if ($path.Equals($base, [StringComparison]::OrdinalIgnoreCase) -or $base.StartsWith($path + '\', [StringComparison]::OrdinalIgnoreCase)) {
-            throw '不能锁定系统、用户配置或程序所在的文件夹及其上级目录。'
-        }
-    }
-    foreach ($entry in $entries) {
-        if ($path.Equals($entry.path, [StringComparison]::OrdinalIgnoreCase) -or
-            $path.StartsWith($entry.path + '\', [StringComparison]::OrdinalIgnoreCase) -or
-            $entry.path.StartsWith($path + '\', [StringComparison]::OrdinalIgnoreCase)) {
-            throw '此文件夹与已管理的文件夹重叠。'
-        }
-    }
-    return $path
+function Register-EntryStartup([string]$launcher, [string]$registryPath='Software\Microsoft\Windows\CurrentVersion\Run') {
+    if(-not $launcher -or -not(Test-Path -LiteralPath $launcher)){throw '无法登记开机入口恢复：找不到 FolderLock.exe。'}
+    $command=[FolderLock.VaultEngine]::Quote([IO.Path]::GetFullPath($launcher))+' --restore-entries'
+    if($command.Length -gt 260){throw '程序路径太长，无法登记开机恢复。请把程序放到较短的固定目录。'}
+    $key=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($registryPath)
+    try {$key.SetValue('FolderLockEntryRestore',$command,[Microsoft.Win32.RegistryValueKind]::String)} finally {$key.Dispose()}
 }
-
-function Set-LockedAcl($entry) {
-    if (-not (Test-Path -LiteralPath $entry.path -PathType Container)) { throw '文件夹已移动或不存在，无法锁定。' }
-    $acl = Get-Acl -LiteralPath $entry.path
-    $rights = [System.Security.AccessControl.FileSystemRights]::ReadData -bor
-        [System.Security.AccessControl.FileSystemRights]::ReadAttributes -bor
-        [System.Security.AccessControl.FileSystemRights]::ReadExtendedAttributes -bor
-        [System.Security.AccessControl.FileSystemRights]::ExecuteFile
-    $inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
-    $identity = New-Object System.Security.Principal.SecurityIdentifier($entry.sid)
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, $rights, $inherit, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Deny)
-    $acl.AddAccessRule($rule)
-    Set-Acl -LiteralPath $entry.path -AclObject $acl
-}
-
-function Restore-OriginalAcl($entry) {
-    if (-not (Test-Path -LiteralPath $entry.path -PathType Container)) { throw '文件夹已移动或不存在，无法恢复权限。' }
-    $acl = Get-Acl -LiteralPath $entry.path
-    $acl.SetSecurityDescriptorSddlForm($entry.sddl, [System.Security.AccessControl.AccessControlSections]::Access)
-    Set-Acl -LiteralPath $entry.path -AclObject $acl
-}
-
-function Lock-Entry([string]$id) {
-    Invoke-State {
-        param($items)
-        $entry = @($items | Where-Object id -eq $id)[0]
-        if (-not $entry) { throw '未找到该文件夹。' }
-        if (-not $entry.locked) {
-            Set-LockedAcl $entry
-            $entry.locked = $true
-            $entry.unlockedAt = $null
-        }
-        @{ Save = $true; Entries = $items }
-    } | Out-Null
-    $script:Managed.Remove($id)
-}
-
-function Unlock-Entry([string]$id, [string]$password) {
-    Invoke-State {
-        param($items, $config)
-        $entry = @($items | Where-Object id -eq $id)[0]
-        if (-not $entry) { throw '未找到该文件夹。' }
-        if (-not $config -or -not (Test-Password $password $config)) { throw '密码错误。' }
-        if ($entry.locked) { Restore-OriginalAcl $entry }
-        $entry.locked = $false
-        $entry.unlockedAt = (Get-Date).ToUniversalTime().ToString('o')
-        @{ Save = $true; Entries = $items }
-    } | Out-Null
-}
-
-function Add-Entry([string]$path) {
-    $result = Invoke-State {
-        param($items, $config)
-        if (-not $config) { throw '请先设置统一密码。' }
-        $safePath = Assert-SafePath $path $items
-        $acl = Get-Acl -LiteralPath $safePath
-        $entry = [pscustomobject]@{
-            id = [guid]::NewGuid().ToString('N'); path = $safePath; sid = $script:MySid
-            sddl = $acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)
-            locked = $false; unlockedAt = $null; shortcut = $null
-        }
-        $newItems = @($items) + @($entry)
-        @{ Save = $true; Entries = $newItems; Entry = $entry }
-    }
-    try { Lock-Entry $result.Entry.id }
-    catch { throw "已保存文件夹，但锁定失败：$($_.Exception.Message)" }
-    return $result.Entry
-}
-
-function Remove-Entry([string]$id) {
-    Invoke-State {
-        param($items)
-        $entry = @($items | Where-Object id -eq $id)[0]
-        if (-not $entry) { throw '未找到该文件夹。' }
-        if ($entry.locked) { throw '请先解锁，再移除。' }
-        $remaining = @($items | Where-Object id -ne $id)
-        @{ Save = $true; Entries = $remaining }
-    } | Out-Null
-}
-
-function Save-Options([bool]$close, [bool]$session, [bool]$sleep, [int]$minutes) {
-    Invoke-State {
-        param($items, $config)
-        if (-not $config) { throw '请先设置统一密码。' }
-        $config.lockOnClose = $close; $config.lockOnSession = $session
-        $config.lockOnSleep = $sleep; $config.minutes = $minutes
-        @{ Save = $true; Entries = $items; Config = $config }
-    } | Out-Null
-}
-
-function Set-OpenShortcut($entry, [string]$shortcutPath) {
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $shortcut.Arguments = '-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -OpenId ' + $entry.id
-    $shortcut.WorkingDirectory = $PSScriptRoot
-    $shortcut.Description = '输入密码后打开此文件夹'
-    $iconPath = Join-Path $PSScriptRoot 'FolderLock.ico'
-    if (Test-Path -LiteralPath $iconPath) { $shortcut.IconLocation = $iconPath + ',0' }
-    $shortcut.Save()
-}
-
-function New-OpenShortcut($entry) {
-    $parent = Split-Path -Parent $entry.path
-    $name = Split-Path -Leaf $entry.path
-    $shortcutPath = Join-Path $parent ($name + ' - 解锁并打开.lnk')
-    if (Test-Path -LiteralPath $shortcutPath) { throw '快捷方式已存在，请先处理同名文件。' }
-    Set-OpenShortcut $entry $shortcutPath
-    Invoke-State {
-        param($items)
-        $item = @($items | Where-Object id -eq $entry.id)[0]
-        $item.shortcut = $shortcutPath
-        @{ Save = $true; Entries = $items }
-    } | Out-Null
-    return $shortcutPath
-}
-
-function Repair-Shortcuts {
-    foreach ($entry in (Get-Entries)) {
-        if ($entry.shortcut -and (Test-Path -LiteralPath $entry.shortcut)) {
-            try { Set-OpenShortcut $entry $entry.shortcut }
-            catch { Show-Error "更新快捷方式失败：$($entry.shortcut)`n$($_.Exception.Message)" }
-        }
-    }
-}
-
-function Get-ExplorerPaths {
-    $paths = @()
+function Restore-EntryHistory([string]$history, [string]$launcher, [string]$logFile) {
+    if(-not(Test-Path -LiteralPath $history)){return 0}
+    $failures=New-Object 'System.Collections.Generic.List[string]'; $restored=0
     try {
-        $shell = New-Object -ComObject Shell.Application
-        foreach ($window in $shell.Windows()) {
-            try {
-                $folder = $window.Document.Folder.Self.Path
-                if ($folder) { $paths += [string]$folder }
-            } catch {}
+        $paths=@(Get-Content -LiteralPath $history -Raw -Encoding UTF8 | ConvertFrom-Json)
+        foreach($path in $paths) {
+            try {if([FolderLock.VaultEngine]::RestoreEntry([string]$path,$launcher)){$restored++}}
+            catch {$failures.Add(([string]$path+': '+$_.Exception.Message))}
         }
-    } catch {}
-    return $paths
-}
-
-function Test-WindowInFolder([string]$path, $windows) {
-    foreach ($windowPath in $windows) {
-        if ($windowPath.Equals($path, [StringComparison]::OrdinalIgnoreCase) -or
-            $windowPath.StartsWith($path + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    } catch {$failures.Add($_.Exception.Message)}
+    if($logFile) {
+        [void][IO.Directory]::CreateDirectory((Split-Path $logFile))
+        [IO.File]::WriteAllLines($logFile,@($failures),[Text.UTF8Encoding]::new($false))
     }
-    return $false
+    return $restored
 }
-
-function Open-Entry([string]$id) {
-    $entry = @(Get-Entries | Where-Object id -eq $id)[0]
-    if (-not $entry) { throw '未找到该文件夹。' }
-    $password = Read-Password "解锁 $($entry.path)"
-    if ($null -eq $password) { return }
-    Unlock-Entry $id $password
-    try { Start-Process explorer.exe -ArgumentList ('"' + $entry.path + '"') }
-    catch { Show-Error "已解锁，但打开 Explorer 失败：$($_.Exception.Message)" }
-    $script:Managed[$id] = @{ Opened = Get-Date; Seen = $false }
-}
-
-function Check-AutoLock {
-    $entries = Get-Entries
-    $config = Get-Config
-    if (-not $config) { return }
-    $windows = Get-ExplorerPaths
-    foreach ($entry in $entries) {
-        if ($entry.locked) { $script:Managed.Remove($entry.id); continue }
-        $opened = [datetime]::MinValue
-        if ($entry.unlockedAt) { $opened = [datetime]::Parse($entry.unlockedAt).ToLocalTime() }
-        $minutes = [int]$config.minutes
-        $expired = ($minutes -gt 0 -and ((Get-Date) - $opened).TotalMinutes -ge $minutes)
-        $watch = $script:Managed[$entry.id]
-        $closed = $false
-        if ($watch -and $config.lockOnClose) {
-            $visible = Test-WindowInFolder $entry.path $windows
-            if ($visible) { $watch.Seen = $true }
-            if ($watch.Seen -and -not $visible) { $closed = $true }
-        }
-        if ($expired -or $closed) {
-            try { Lock-Entry $entry.id }
-            catch { Show-Error "自动锁定失败：$($entry.path)`n$($_.Exception.Message)" }
-        }
+if ($LibraryOnly) { return }
+if(-not $LauncherPath) {
+    foreach($candidate in @((Join-Path $PSScriptRoot 'FolderLock.exe'),(Join-Path $PSScriptRoot 'dist\FolderLock.exe'))) {
+        if(Test-Path -LiteralPath $candidate){$LauncherPath=$candidate; break}
     }
 }
-
-function Lock-OnEvent([string]$kind) {
-    $config = Get-Config
-    if (-not $config) { return }
-    foreach ($entry in (Get-Entries)) {
-        if ($entry.locked) { continue }
-        if (($kind -eq 'session' -and $config.lockOnSession) -or ($kind -eq 'sleep' -and $config.lockOnSleep)) {
-            try { Lock-Entry $entry.id }
-            catch { Show-Error "系统事件触发锁定失败：$($entry.path)`n$($_.Exception.Message)" }
-        }
-    }
-}
-
-function Start-SystemWatch {
-    Register-ObjectEvent -InputObject ([Microsoft.Win32.SystemEvents]) -EventName SessionSwitch -SourceIdentifier 'FolderLock.Session' | Out-Null
-    Register-ObjectEvent -InputObject ([Microsoft.Win32.SystemEvents]) -EventName PowerModeChanged -SourceIdentifier 'FolderLock.Power' | Out-Null
-}
-
-function Read-SystemEvents {
-    foreach ($event in @(Get-Event -SourceIdentifier 'FolderLock.Session' -ErrorAction SilentlyContinue)) {
-        if ($event.SourceEventArgs.Reason -eq [Microsoft.Win32.SessionSwitchReason]::SessionLock) { Lock-OnEvent 'session' }
-        Remove-Event -EventIdentifier $event.EventIdentifier
-    }
-    foreach ($event in @(Get-Event -SourceIdentifier 'FolderLock.Power' -ErrorAction SilentlyContinue)) {
-        if ($event.SourceEventArgs.Mode -eq [Microsoft.Win32.PowerModes]::Suspend) { Lock-OnEvent 'sleep' }
-        Remove-Event -EventIdentifier $event.EventIdentifier
-    }
-}
-
-function Stop-SystemWatch {
-    Unregister-Event -SourceIdentifier 'FolderLock.Session' -ErrorAction SilentlyContinue
-    Unregister-Event -SourceIdentifier 'FolderLock.Power' -ErrorAction SilentlyContinue
-}
-
-if ($OpenId) {
-    try {
-        Open-Entry $OpenId
-        if (-not $script:Managed.ContainsKey($OpenId)) { exit 0 }
-        Start-SystemWatch
-        $context = New-Object System.Windows.Forms.ApplicationContext
-        $timer = New-Object System.Windows.Forms.Timer
-        $timer.Interval = 5000
-        $timer.Add_Tick({
-            try {
-                Read-SystemEvents
-                Check-AutoLock
-                $entry = @(Get-Entries | Where-Object id -eq $OpenId)[0]
-                if (-not $entry -or $entry.locked) { $timer.Stop(); $context.ExitThread() }
-            } catch { Show-Error $_.Exception.Message }
-        })
-        $timer.Start()
-        [System.Windows.Forms.Application]::Run($context)
-    } catch { Show-Error $_.Exception.Message }
-    finally { Stop-SystemWatch }
-    exit
-}
-
-try {
-    foreach ($entry in (Get-Entries)) {
-        if (-not $entry.locked) { Lock-Entry $entry.id }
-    }
-    if (-not (Ensure-GlobalConfig)) { $script:Mutex.Dispose(); return }
-    Repair-Shortcuts
-} catch {
-    Show-Error $_.Exception.Message
-    $script:Mutex.Dispose()
+if($RestoreEntries) {
+    Restore-EntryHistory (Join-Path $env:LOCALAPPDATA 'FolderLock\vaults.json') $LauncherPath (Join-Path $env:LOCALAPPDATA 'FolderLock\entry-restore.log') | Out-Null
     return
 }
-
-$form = New-Object System.Windows.Forms.Form
-$form.Text = 'FolderLock · 文件夹访问锁'
-$form.Size = New-Object System.Drawing.Size(850, 540)
-$form.MinimumSize = New-Object System.Drawing.Size(750, 500)
-$form.StartPosition = 'CenterScreen'
-$iconPath = Join-Path $PSScriptRoot 'FolderLock.ico'
-if (Test-Path -LiteralPath $iconPath) { $form.Icon = New-Object System.Drawing.Icon($iconPath) }
-$list = New-Object System.Windows.Forms.ListView
-$list.View = 'Details'; $list.FullRowSelect = $true; $list.MultiSelect = $false
-$list.Location = New-Object System.Drawing.Point(16, 16)
-$list.Size = New-Object System.Drawing.Size(800, 300)
-$list.Anchor = 'Top,Left,Right,Bottom'
-[void]$list.Columns.Add('文件夹', 590)
-[void]$list.Columns.Add('状态', 130)
-$form.Controls.Add($list)
-$list.AllowDrop = $true
-
-function Add-Button([string]$label, [int]$x, [int]$y, [scriptblock]$click) {
-    $button = New-Object System.Windows.Forms.Button
-    $button.Text = $label
-    $button.Location = New-Object System.Drawing.Point($x, $y)
-    $button.Size = New-Object System.Drawing.Size(128, 32)
-    $button.Anchor = 'Bottom,Left'
-    $button.Add_Click($click)
-    $form.Controls.Add($button)
-    return $button
+$script:requestDirectory=Join-Path $PSScriptRoot 'open-requests'
+function Queue-Open([string]$path, [switch]$Encrypt) {
+    [void][IO.Directory]::CreateDirectory($script:requestDirectory)
+    $request=Join-Path $script:requestDirectory ([guid]::NewGuid().ToString('N')+$(if($Encrypt){'.encrypt.request'}else{'.request'}))
+    [IO.File]::WriteAllText(($request+'.new'),$path,[Text.UTF8Encoding]::new($false)); [IO.File]::Move(($request+'.new'),$request)
 }
-
-function Selected-Id { if ($list.SelectedItems.Count) { return [string]$list.SelectedItems[0].Tag }; return $null }
-function Refresh-List {
-    $selected = Selected-Id
-    $list.BeginUpdate()
-    try {
-        $list.Items.Clear()
-        foreach ($entry in (Get-Entries)) {
-            $row = New-Object System.Windows.Forms.ListViewItem($entry.path)
-            [void]$row.SubItems.Add($(if ($entry.locked) { '已锁定' } else { '已解锁' }))
-            $row.Tag = $entry.id
-            [void]$list.Items.Add($row)
-            if ($entry.id -eq $selected) { $row.Selected = $true }
+$created=$false
+$script:uiMutex=[Threading.Mutex]::new($true,('Local\FolderLock2UI-'+[Security.Principal.WindowsIdentity]::GetCurrent().User.Value),[ref]$created)
+if(-not $created) {if($EncryptPath){Queue-Open $EncryptPath -Encrypt}else{Queue-Open $OpenPath}; $script:uiMutex.Dispose(); return}
+$script:mounts = @{}; $script:job = $null; $script:pending = $null; $script:engine = $null
+$script:lockWork = $null; $script:closeRequested = $false
+$script:openWork = $null
+$script:historyFile = Join-Path $env:LOCALAPPDATA 'FolderLock\vaults.json'
+$script:paths = @()
+if (Test-Path -LiteralPath $script:historyFile) {
+    try { $loaded = Get-Content -LiteralPath $script:historyFile -Raw -Encoding UTF8 | ConvertFrom-Json; $script:paths = @($loaded) }
+    catch { Show-Error '最近目录记录无法读取。可以直接粘贴保险箱路径打开，密文不受影响。' }
+}
+function Add-History([string]$path) {
+    $script:paths = @(@($script:paths) + $path | Select-Object -Unique)
+    [void][System.IO.Directory]::CreateDirectory((Split-Path $script:historyFile))
+    $temp = $script:historyFile + '.new'
+    [System.IO.File]::WriteAllText($temp, (ConvertTo-Json -InputObject @($script:paths)), [System.Text.UTF8Encoding]::new($false))
+    if (Test-Path -LiteralPath $script:historyFile) { [System.IO.File]::Replace($temp, $script:historyFile, [System.Management.Automation.Language.NullString]::Value) }
+    else { [System.IO.File]::Move($temp, $script:historyFile) }
+}
+function Enable-EntryRecovery {
+    try {Register-EntryStartup $LauncherPath}
+    catch {Show-Error ('文件仍可正常解锁，但开机入口恢复未启用：'+$_.Exception.Message)}
+}
+function Enable-ContextMenu {
+    try {Register-FolderContextMenu $LauncherPath}
+    catch {$status.Text='右键菜单未登记，可点击“安装 / 更新右键菜单”重试：'+$_.Exception.Message}
+}
+function Get-Engine {
+    if (-not $RclonePath -or -not (Test-Path -LiteralPath $RclonePath)) { throw '缺少 rclone.exe。请完整解压 2.4 ZIP 包，或运行 Prepare-Dependencies.ps1。' }
+    if (-not $script:engine) { $script:engine = New-Object FolderLock.VaultEngine($RclonePath) }; return $script:engine
+}
+function Assert-NotLegacy([string]$path) {
+    $file = Join-Path $env:LOCALAPPDATA 'FolderLock\folders.json'
+    if (-not (Test-Path -LiteralPath $file)) { return }
+    $old = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
+    foreach ($entry in $old.entries) {
+        $other = [System.IO.Path]::GetFullPath($entry.path).TrimEnd('\')
+        if ($path -ieq $other -or $path.StartsWith($other + '\', [StringComparison]::OrdinalIgnoreCase) -or $other.StartsWith($path + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw '此目录仍由旧版 ACL 管理。请点击“旧版 ACL 恢复”，解锁并移除管理后再加密。'
         }
-    } finally { $list.EndUpdate() }
-}
-
-$add = Add-Button '添加文件夹' 16 332 {
-    try {
-        $picker = New-Object System.Windows.Forms.FolderBrowserDialog
-        $picker.Description = '选择要管理的文件夹'
-        if ($picker.ShowDialog() -ne 'OK') { return }
-        $entry = Add-Entry $picker.SelectedPath
-        try { $shortcut = New-OpenShortcut $entry }
-        catch { Show-Error "文件夹已锁定，但创建快捷方式失败：$($_.Exception.Message)" }
-        Refresh-List
-    } catch { Show-Error $_.Exception.Message }
-}
-$list.Add_DragEnter({
-    param($sender, $eventArgs)
-    if ($eventArgs.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
-        $eventArgs.Effect = [System.Windows.Forms.DragDropEffects]::Copy
     }
-})
-$list.Add_DragDrop({
-    param($sender, $eventArgs)
-    foreach ($path in @($eventArgs.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop))) {
+}
+$form = New-Object System.Windows.Forms.Form
+$iconFile=Join-Path $PSScriptRoot 'FolderLock.ico'
+if(-not(Test-Path -LiteralPath $iconFile)){$iconFile=Join-Path $PSScriptRoot 'build\FolderLock.ico'}
+if(Test-Path -LiteralPath $iconFile){$form.Icon=[Drawing.Icon]::new($iconFile,32,32)}
+$form.Text = 'FolderLock 2.4.2 · 文件夹加密'; $form.ClientSize = New-Object System.Drawing.Size(870, 570)
+$form.MinimumSize = $form.Size; $form.StartPosition = 'CenterScreen'; $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+$label = New-Object System.Windows.Forms.Label
+$label.Text = '文件夹路径'; $label.SetBounds(20, 18, 130, 24); $form.Controls.Add($label)
+$pathBox = New-Object System.Windows.Forms.TextBox
+$pathBox.SetBounds(20, 46, 700, 28); $pathBox.AccessibleName = '粘贴文件夹完整路径'; $form.Controls.Add($pathBox)
+function Button([string]$text, [int]$x, [int]$y, [int]$width, [scriptblock]$action) {
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $text; $b.SetBounds($x, $y, $width, 34); $b.Add_Click($action); $form.Controls.Add($b); return $b
+}
+$browse = Button '浏览…' 734 43 116 {
+    $picker = New-Object System.Windows.Forms.FolderBrowserDialog
+    try { if ($picker.ShowDialog() -eq 'OK') { $pathBox.Text = $picker.SelectedPath } } finally { $picker.Dispose() }
+}
+$list = New-Object System.Windows.Forms.ListView
+$list.View = 'Details'; $list.FullRowSelect = $true; $list.MultiSelect = $false; $list.SetBounds(20, 94, 830, 222)
+[void]$list.Columns.Add('访问目录（密文存于同盘相邻存储目录）', 600); [void]$list.Columns.Add('状态', 205); $form.Controls.Add($list)
+$list.Add_SelectedIndexChanged({ if ($list.SelectedItems.Count) { $pathBox.Text = $list.SelectedItems[0].Text } })
+function Refresh-List {
+    $list.Items.Clear()
+    foreach ($path in $script:paths) {
+        $row = New-Object System.Windows.Forms.ListViewItem([string]$path); $state = '未完成 / 需继续'
         try {
-            if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw '只能拖入文件夹。' }
-            $entry = Add-Entry $path
-            try { [void](New-OpenShortcut $entry) }
-            catch { Show-Error "文件夹已锁定，但创建快捷方式失败：$($_.Exception.Message)" }
-        } catch { Show-Error "$path`n$($_.Exception.Message)" }
+            if ([FolderLock.VaultEngine]::Read($path).State -eq 'ready') { $state = '已加密（未挂载）' }
+            if ([FolderLock.VaultEngine]::HasPlaintext($path)) { $state = '含明文 / 未完成' }
+            if ([FolderLock.VaultEngine]::HasWriteCache($path)) { $state = '写缓存待恢复 / 未锁定' }
+            if ($script:mounts.ContainsKey($path)) { $state = '读写访问 ' + $script:mounts[$path].Drive }
+            if ($script:job -and $script:jobPath -eq $path) { $state = '正在转换' }
+        } catch { $state = '配置不存在 / 无法读取' }
+        [void]$row.SubItems.Add($state); [void]$list.Items.Add($row)
     }
-    Refresh-List
-})
-$open = Add-Button '解锁并打开' 153 332 {
-    try { $id = Selected-Id; if ($id) { Open-Entry $id; Refresh-List } }
-    catch { Show-Error $_.Exception.Message }
 }
-$lock = Add-Button '立即锁定' 290 332 {
-    try { $id = Selected-Id; if ($id) { Lock-Entry $id; Refresh-List } }
-    catch { Show-Error $_.Exception.Message }
-}
-$remove = Add-Button '移除管理' 427 332 {
+function Current-Path { return [FolderLock.VaultEngine]::Normalize($pathBox.Text) }
+$encrypt = Button '加密 / 继续加密' 20 334 155 {
+    $script:prompting=$true
     try {
-        $id = Selected-Id
-        if (-not $id) { return }
-        $entry = @(Get-Entries | Where-Object id -eq $id)[0]
-        Remove-Entry $id
-        if ($entry.shortcut -and (Test-Path -LiteralPath $entry.shortcut)) { Remove-Item -LiteralPath $entry.shortcut -Force }
-        Refresh-List
-    } catch { Show-Error $_.Exception.Message }
+        $root = Current-Path; Assert-NotLegacy $root
+        if ($script:mounts.ContainsKey($root)) { throw '请先锁定此目录。' }
+        $engine = Get-Engine
+        if (-not (Test-WinFsp)) { throw '请先点击“准备挂载组件”安装 WinFsp，再进行加密。' }
+        $exists = Test-Path -LiteralPath (Join-Path ([FolderLock.VaultEngine]::StoragePath($root)) 'vault.json')
+        $password = Read-Password $(if ($exists) { '输入原密码，继续加密' } else { '设置此目录的加密密码' }) (-not $exists)
+        if ($null -eq $password) { return }
+        Add-History $root; $script:jobPath = $root; $script:job = $engine.BeginConvert($root, $password, $LauncherPath); $password = $null
+        Set-Busy $true; Refresh-List
+    } catch { Show-Error $_.Exception.Message } finally {$script:prompting=$false}
 }
-
-$closeBox = New-Object System.Windows.Forms.CheckBox
-$closeBox.Text = 'Explorer 窗口关闭后锁定'; $closeBox.AutoSize = $true
-$closeBox.Location = New-Object System.Drawing.Point(16, 391); $closeBox.Anchor = 'Bottom,Left'
-$form.Controls.Add($closeBox)
-$sessionBox = New-Object System.Windows.Forms.CheckBox
-$sessionBox.Text = 'Windows 锁屏后锁定'; $sessionBox.AutoSize = $true
-$sessionBox.Location = New-Object System.Drawing.Point(230, 391); $sessionBox.Anchor = 'Bottom,Left'
-$form.Controls.Add($sessionBox)
-$sleepBox = New-Object System.Windows.Forms.CheckBox
-$sleepBox.Text = '睡眠前锁定'; $sleepBox.AutoSize = $true
-$sleepBox.Location = New-Object System.Drawing.Point(420, 391); $sleepBox.Anchor = 'Bottom,Left'
-$form.Controls.Add($sleepBox)
-$minutesLabel = New-Object System.Windows.Forms.Label
-$minutesLabel.Text = '最长解锁时间（分钟）'; $minutesLabel.AutoSize = $true
-$minutesLabel.Location = New-Object System.Drawing.Point(16, 425); $minutesLabel.Anchor = 'Bottom,Left'
-$form.Controls.Add($minutesLabel)
-$unlimitedBox = New-Object System.Windows.Forms.CheckBox
-$unlimitedBox.Text = '无限制'; $unlimitedBox.AutoSize = $true
-$unlimitedBox.Location = New-Object System.Drawing.Point(246, 423); $unlimitedBox.Anchor = 'Bottom,Left'
-$form.Controls.Add($unlimitedBox)
-$minutesBox = New-Object System.Windows.Forms.NumericUpDown
-$minutesBox.Minimum = 1; $minutesBox.Maximum = 1440; $minutesBox.Value = 10
-$minutesBox.Location = New-Object System.Drawing.Point(174, 422); $minutesBox.Width = 60; $minutesBox.Anchor = 'Bottom,Left'
-$form.Controls.Add($minutesBox)
-$unlimitedBox.Add_CheckedChanged({ $minutesBox.Enabled = -not $unlimitedBox.Checked })
-$save = Add-Button '保存全局设置' 340 417 {
+$driveLabel = New-Object System.Windows.Forms.Label
+$driveLabel.Text = '位置'; $driveLabel.SetBounds(188, 342, 40, 24); $form.Controls.Add($driveLabel)
+$drive = New-Object System.Windows.Forms.ComboBox
+$drive.DropDownStyle = 'DropDownList'; $drive.SetBounds(230, 337, 66, 28)
+[void]$drive.Items.Add('原路径')
+foreach ($letter in 90..68) { [void]$drive.Items.Add(([char]$letter).ToString() + ':') }; $drive.SelectedIndex = 0; $form.Controls.Add($drive)
+$unlock = Button '解锁并打开（可读写）' 310 334 190 {
+    $script:prompting=$true
     try {
-        $minutes = $(if ($unlimitedBox.Checked) { 0 } else { [int]$minutesBox.Value })
-        Save-Options $closeBox.Checked $sessionBox.Checked $sleepBox.Checked $minutes
-    } catch { Show-Error $_.Exception.Message }
+        $root = Current-Path
+        if ($script:mounts.ContainsKey($root)) { Start-Process explorer.exe -ArgumentList ($script:mounts[$root].Drive + '\'); return }
+        if (-not (Test-WinFsp)) { throw '未安装 WinFsp，请点击“准备挂载组件”。' }
+        $password = Read-Password '输入此目录的加密密码'
+        if ($null -eq $password) { return }
+        if($drive.SelectedItem -eq '原路径') {$script:openWork=(Get-Engine).BeginOpenOriginal($root,$password,$LauncherPath)}
+        else {$script:openWork = (Get-Engine).BeginOpen($root, $password, [string]$drive.SelectedItem)}
+        $script:pendingRoot = $root; $script:pendingAt = Get-Date; $password = $null
+        $status.Text = '正在挂载…'; Set-Busy $true
+    } catch { Show-Error $_.Exception.Message } finally {$script:prompting=$false}
 }
-$config = Get-Config
-$closeBox.Checked = [bool]$config.lockOnClose
-$sessionBox.Checked = [bool]$config.lockOnSession
-$sleepBox.Checked = [bool]$config.lockOnSleep
-$unlimitedBox.Checked = ([int]$config.minutes -eq 0)
-$minutesBox.Value = [Math]::Max(1, [Math]::Min(1440, [int]$config.minutes))
-$minutesBox.Enabled = -not $unlimitedBox.Checked
+function Lock-All {
+    if ($script:lockWork -or $script:mounts.Count -eq 0) { return }
+    $script:lockWork = [FolderLock.Mount]::BeginLockAll([FolderLock.Mount[]]@($script:mounts.Values))
+    Set-Busy $true; $status.Text = '等待文件关闭并将修改加密保存，完成前请勿强制退出。'
+}
+$lock = Button '安全锁定全部' 514 334 115 { Lock-All }
+$cancel = Button '暂停 / 取消' 643 334 115 {
+    if ($script:job) { $script:job.CancelRequested = $true; $status.Text = '正在安全停止；当前明文会保留，稍后可继续。' }
+    if ($script:lockWork) { $script:lockWork.CancelRequested = $true; $script:closeRequested = $false }
+}; $cancel.Enabled = $false
+$progress = New-Object System.Windows.Forms.ProgressBar
+$progress.SetBounds(20, 383, 830, 12); $form.Controls.Add($progress)
+$status = New-Object System.Windows.Forms.Label
+$status.Text = '粘贴路径后点击“加密”。首次转换需额外容纳最大的单个文件。'; $status.SetBounds(20, 408, 830, 45); $form.Controls.Add($status)
 $hint = New-Object System.Windows.Forms.Label
-$hint.Text = '将文件夹拖入上方列表，或点击“添加文件夹”。自动锁定设置对所有文件夹生效。'
-$hint.AutoSize = $true
-$hint.Location = New-Object System.Drawing.Point(16, 464); $hint.Anchor = 'Bottom,Left'
-$form.Controls.Add($hint)
-
+$hint.Text = "默认在原目录读写，下载器无需改路径；锁定后双击目录内的解锁快捷方式。`r`n下载/合并完成后安全锁定；锁定期间写入会失败。异常退出后重新解锁恢复写缓存。"
+$hint.SetBounds(20, 460, 830, 48); $form.Controls.Add($hint)
+$setup = Button '准备挂载组件' 20 516 155 {
+    $setupPath = Join-Path $PSScriptRoot 'Prepare-Dependencies.ps1'
+    Start-Process powershell.exe -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $setupPath + '" -InstallWinFsp -RclonePath "' + $RclonePath + '"') -WindowStyle Hidden
+    $status.Text = '依赖准备程序已启动；安装 WinFsp 时会出现 Windows 安装确认。'
+}
+$legacy = Button '旧版 ACL 恢复' 190 516 155 {
+    $legacyPath = Join-Path $PSScriptRoot 'Legacy-FolderLock.ps1'
+    Start-Process powershell.exe -ArgumentList ('-NoProfile -STA -ExecutionPolicy Bypass -File "' + $legacyPath + '"') -WindowStyle Hidden
+}
+$import = Button '导入已有密文…' 360 516 160 {
+    $script:prompting=$true
+    try {
+        if(-not(Test-WinFsp)){throw '请先准备挂载组件，安装 WinFsp。'}
+        $storage=$pathBox.Text.Trim().Trim('"')
+        if(-not(Test-Path -LiteralPath (Join-Path $storage 'vault.json') -ErrorAction SilentlyContinue)) {
+            $picker=New-Object System.Windows.Forms.FolderBrowserDialog
+            $picker.Description='选择完整的 Private.folderlock 密文存储目录'
+            try {if($picker.ShowDialog() -ne 'OK'){return};$storage=$picker.SelectedPath} finally {$picker.Dispose()}
+        }
+        $root=[FolderLock.VaultEngine]::ImportRoot($storage)
+        if($script:mounts.ContainsKey($root)){throw '此目录已经解锁，请先安全锁定。'}
+        $password=Read-Password '输入此密文目录的原密码'
+        if($null -eq $password){return}
+        $script:openWork=(Get-Engine).BeginImportOriginal($storage,$password,$LauncherPath);$password=$null
+        $script:pendingRoot=$root;$script:pendingAt=Get-Date;$pathBox.Text=$root;$drive.SelectedIndex=0
+        $status.Text='正在验证密码并重建本机入口…';Set-Busy $true
+    } catch {Show-Error $_.Exception.Message} finally {$script:prompting=$false}
+}
+$contextMenu = Button '安装 / 更新右键菜单' 540 516 310 { Enable-ContextMenu; }
+function Set-Busy([bool]$busy) {
+    $busy = $busy -or $null -ne $script:job -or $null -ne $script:lockWork -or $null -ne $script:pending -or $null -ne $script:openWork
+    foreach ($control in @($encrypt, $unlock, $browse, $pathBox, $drive, $setup, $legacy, $import, $list)) { $control.Enabled = -not $busy }
+    $cancel.Enabled = $busy -and ($null -ne $script:job -or $null -ne $script:lockWork); $progress.Style = $(if ($busy) { 'Marquee' } else { 'Blocks' })
+}
+$timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 250
+$timer.Add_Tick({
+    try {
+        if ($script:job) {
+            $status.Text = $script:job.Message
+            if ($script:job.Done) {
+                $errorText = $script:job.Error; $paused = $script:job.CancelRequested; $script:job = $null; Set-Busy $false; Refresh-List
+                if ($errorText) { $status.Text = '未完成：仍可能有明文，请处理错误后继续加密。'; Show-Error $errorText }
+                elseif ($paused) { $status.Text = '已暂停，仍有明文。使用原密码“继续加密”即可恢复。' }
+                else { Enable-EntryRecovery; $status.Text = '加密完成并已逐文件验证。登录 Windows 时会自动修复锁入口。' }
+            }
+        }
+        if ($script:openWork) {
+            $status.Text = $script:openWork.Message
+            if ($script:openWork.Done) {
+                $openError = $script:openWork.Error; $script:pending = $script:openWork.OpenedMount; $script:openWork = $null; $script:pendingAt = Get-Date
+                if ($openError) { Set-Busy $false; Refresh-List; $status.Text = '解锁未完成；原目录及恢复缓存已保留。'; throw $openError }
+            }
+        }
+        if ($script:pending) {
+            if (-not $script:pending.Alive) { $failure = $script:pending.Failure; $script:pending.Abort(); $script:pending = $null; Set-Busy $false; throw $failure }
+            if (Test-Path ($script:pending.Drive + '\')) {
+                $script:mounts[$script:pendingRoot] = $script:pending; $script:pending = $null
+                Add-History $script:pendingRoot; Enable-EntryRecovery; Set-Busy $false; Refresh-List
+                Start-Process explorer.exe -ArgumentList ($script:mounts[$script:pendingRoot].Drive + '\'); $status.Text = '已解锁，可读写；使用“安全锁定”提交修改并清理写缓存。'
+            } elseif (((Get-Date) - $script:pendingAt).TotalSeconds -gt 30) {
+                $script:pending.Abort(); $script:pending = $null; Set-Busy $false; throw '挂载超时，请检查 WinFsp 和盘符。'
+            }
+        }
+        if ($script:lockWork) {
+            $status.Text = $script:lockWork.Message
+            if ($script:lockWork.Done) {
+                $lockError = $script:lockWork.Error; $script:lockWork = $null
+                foreach ($root in @($script:mounts.Keys)) {
+                    if ($script:mounts[$root].Closed) { $script:mounts.Remove($root) }
+                    elseif (-not $script:mounts[$root].Attached) { $script:mounts[$root].Abort(); $script:mounts.Remove($root) }
+                }
+                Set-Busy $false; Refresh-List
+                if ($lockError) { $script:closeRequested = $false; $status.Text = '尚未安全锁定；缓存已保留，请处理后重试。'; Show-Error $lockError }
+                else { $status.Text = '已锁定：修改已加密保存，临时写缓存已清理。'; if ($script:closeRequested) { $form.Close() } }
+            }
+        } else {
+            foreach ($root in @($script:mounts.Keys)) {
+                if (-not $script:mounts[$root].Alive) { $script:mounts[$root].Abort(); $script:mounts.Remove($root); Refresh-List; $status.Text = '挂载异常退出：写缓存可能尚未提交，请重新解锁恢复。' }
+            }
+        }
+        if(-not $script:prompting -and -not $script:job -and -not $script:openWork -and -not $script:pending -and -not $script:lockWork -and (Test-Path -LiteralPath $script:requestDirectory)) {
+            $request=Get-ChildItem -LiteralPath $script:requestDirectory -Filter '*.request' -File | Sort-Object LastWriteTimeUtc | Select-Object -First 1
+            if($request) {
+                $target=[IO.File]::ReadAllText($request.FullName,[Text.Encoding]::UTF8); [IO.File]::Delete($request.FullName)
+                $form.WindowState='Normal'; $form.Show(); [void]$form.Activate()
+                if($target){$pathBox.Text=$target; $drive.SelectedIndex=0; if($request.Name.EndsWith('.encrypt.request')){$encrypt.PerformClick()}else{$unlock.PerformClick()}}
+            }
+        }
+        foreach ($event in @(Get-Event -SourceIdentifier FolderLock2.Session -ErrorAction SilentlyContinue)) {
+            if ($event.SourceEventArgs.Reason -eq [Microsoft.Win32.SessionSwitchReason]::SessionLock) { Lock-All }
+            Remove-Event -EventIdentifier $event.EventIdentifier
+        }
+    } catch { Show-Error $_.Exception.Message }
+})
+$form.Add_FormClosing({ param($sender, $eventArgs)
+    if ($script:job) { $script:job.CancelRequested = $true; $eventArgs.Cancel = $true; $status.Text = '正在安全暂停转换。完成后可关闭。' }
+    if ($script:pending) { $eventArgs.Cancel = $true; $status.Text = '请等待挂载完成，再安全锁定退出。' }
+    if ($script:openWork) { $eventArgs.Cancel = $true; $status.Text = '正在验证或恢复缓存，请完成后再安全退出。' }
+    if ($script:mounts.Count -gt 0 -or $script:lockWork) { $eventArgs.Cancel = $true; $script:closeRequested = $true; Lock-All }
+})
+if ($OpenPath) { $pathBox.Text = $OpenPath }
+if ($EncryptPath) { $pathBox.Text = $EncryptPath }
+$form.Add_Shown({if($EncryptPath){$encrypt.PerformClick()}elseif($OpenPath){$drive.SelectedIndex=0; $unlock.PerformClick()}})
 try {
-    Refresh-List
-    Start-SystemWatch
-    $tick = New-Object System.Windows.Forms.Timer
-    $tick.Interval = 5000
-    $tick.Add_Tick({
-        try {
-            Read-SystemEvents
-            Check-AutoLock
-            Refresh-List
-        } catch { Show-Error $_.Exception.Message }
-    })
-    $tick.Start()
-    [void]$form.ShowDialog()
-} catch { Show-Error $_.Exception.Message }
-finally {
-    if ($tick) { $tick.Stop(); $tick.Dispose() }
-    Stop-SystemWatch
-    foreach ($entry in (Get-Entries)) {
-        if (-not $entry.locked) { try { Lock-Entry $entry.id } catch { Show-Error "退出时锁定失败：$($entry.path)`n$($_.Exception.Message)" } }
+    Register-ObjectEvent -InputObject ([Microsoft.Win32.SystemEvents]) -EventName SessionSwitch -SourceIdentifier FolderLock2.Session | Out-Null
+    if($script:paths.Count) {
+        Restore-EntryHistory $script:historyFile $LauncherPath (Join-Path (Split-Path $script:historyFile) 'entry-restore.log') | Out-Null
+        Enable-EntryRecovery
     }
+    Enable-ContextMenu;
+    Refresh-List; $timer.Start(); [void]$form.ShowDialog()
+} finally {
+    $timer.Stop(); $timer.Dispose(); Unregister-Event -SourceIdentifier FolderLock2.Session -ErrorAction SilentlyContinue
+    if ($script:pending) { $script:pending.Abort() }
+    foreach ($mount in @($script:mounts.Values)) { $mount.Abort() }
     $form.Dispose()
-    $script:Mutex.Dispose()
+    $script:uiMutex.ReleaseMutex(); $script:uiMutex.Dispose()
 }
