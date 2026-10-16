@@ -24,13 +24,15 @@ Windows 本地文件夹加密工具。粘贴目录地址、设置密码后，逐
 
 **存储位置：**例如访问路径是 `D:\Documents\Private`，真实密文位于同盘相邻的隐藏存储目录 `D:\Documents\Private.folderlock`。原路径是工具管理的固定目录入口，解锁时指向加密文件系统，锁定时指向只读的解锁入口。**备份必须包含整个 `Private.folderlock`，不能只备份 Private 的入口；不要删除存储目录或手工修改内部文件。** 密码验证标记、随机盐、状态及恢复缓存也在此存储目录内。最近目录记录不是恢复密文所必需的。
 
-锁定期间向原路径下载会被拒绝，不会自动解锁或落成普通明文。请先解锁再开始下载，完成下载和合并后安全锁定。
+普通程序在锁定期间写入原路径会被拒绝。更新后的 OnlineVideoDownloader 只在原有流程准备写入目标目录时检查 FolderLock：目录已锁定则弹出密码框，成功解锁后继续原来的保存操作。下载位置、缓存和拼接流程保持原样；取消密码框、密码错误或保存失败时保留下载数据并显示恢复位置。密码只在 FolderLock 内使用；保存后目录保持解锁，使用完仍需安全锁定。
 
 ## 登录后恢复入口与单一锁图标
 
 2.3 在首次打开已有保险箱、成功加密或导入后，登记当前用户的 Windows 登录启动项 `FolderLockEntryRestore`，命令为 `FolderLock.exe --restore-entries`。登录后静默重建最近目录中的锁入口，修复已确认失效的挂载点；无需先手动打开主界面。只处理入口，不加载密码、不挂载明文，不清理或假报写缓存已提交。崩溃后的待恢复缓存保持原样，点击锁图标输入原密码后恢复。操作互斥改用可在崩溃后恢复的内核锁，避免遗留磁盘锁文件挡住入口恢复。
 
 这是 Windows **登录后**恢复，系统可能延迟启动；程序应保留在固定目录，不要在 Windows 中禁用其启动项。启动恢复日志在 `%LOCALAPPDATA%\FolderLock\entry-restore.log`。若磁盘尚未连接、入口被替换或存在未知文件，会保留数据并记录错误。运行正常主界面也会补做入口恢复。卸载时可在 Windows 启动应用中禁用此项，或删除当前用户 `Software\Microsoft\Windows\CurrentVersion\Run` 下的 `FolderLockEntryRestore` 值。
+
+已修复 Windows PowerShell 5.1 下历史记录包含多个目录时自动恢复失败的问题。更新或移动程序后，运行新位置的 EXE 会逐个更新已登记目录的解锁入口；快捷方式提示目标已移动时，也可直接运行新位置的程序修复。
 
 `Private` 是唯一日常入口；`Private.folderlock` 是真实存储，两者不表示两份视频。2.3 将存储目录设为隐藏/系统目录，旧版内部 `Open` 快捷方式在确认属于工具后移除，改用隐藏的数据模板 `.entry-template.dat`。正常显示只需使用 Private 中的“解锁文件夹”。手动显示受保护系统文件时仍能看到真实存储，请勿删除。登录机制参考 [Microsoft Run 注册表说明](https://learn.microsoft.com/en-us/windows/win32/setupapi/run-and-runonce-registry-keys)。
 
@@ -116,6 +118,9 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\original-path-tes
 powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\entry-test.ps1
 powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\open-flow-test.ps1
 powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\startup-portability-test.ps1
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\history-restore-test.ps1
+# 关闭 OVD 后，用实际下载器测试 HTTP 下载、锁定失败保留分片和安全锁定往返：
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\download-import-test.ps1
 powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\launch-test.ps1
 powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\dialog-test.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\legacy-smoke-test.ps1

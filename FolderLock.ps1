@@ -1,4 +1,4 @@
-﻿param([switch]$LibraryOnly, [string]$RclonePath, [string]$OpenPath, [string]$LauncherPath, [switch]$RestoreEntries, [string]$EncryptPath)
+﻿param([switch]$LibraryOnly, [string]$RclonePath, [string]$OpenPath, [string]$LauncherPath, [switch]$RestoreEntries, [string]$EncryptPath, [string]$UnlockRequestPath)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -63,7 +63,10 @@ function Restore-EntryHistory([string]$history, [string]$launcher, [string]$logF
     if(-not(Test-Path -LiteralPath $history)){return 0}
     $failures=New-Object 'System.Collections.Generic.List[string]'; $restored=0
     try {
-        $paths=@(Get-Content -LiteralPath $history -Raw -Encoding UTF8 | ConvertFrom-Json)
+        # Windows PowerShell 5.1 emits the JSON array as a single pipeline object.
+        # Assign first so @() enumerates its paths instead of wrapping a nested array.
+        $loaded=Get-Content -LiteralPath $history -Raw -Encoding UTF8 | ConvertFrom-Json
+        $paths=@($loaded)
         foreach($path in $paths) {
             try {if([FolderLock.VaultEngine]::RestoreEntry([string]$path,$launcher)){$restored++}}
             catch {$failures.Add(([string]$path+': '+$_.Exception.Message))}
@@ -74,6 +77,30 @@ function Restore-EntryHistory([string]$history, [string]$launcher, [string]$logF
         [IO.File]::WriteAllLines($logFile,@($failures),[Text.UTF8Encoding]::new($false))
     }
     return $restored
+}
+function Read-DownloadUnlockRequest([string]$file) {
+    $file=[IO.Path]::GetFullPath($file)
+    if($file.StartsWith('\\') -or ([IO.FileInfo]$file).Length -gt 16384){throw '下载解锁请求文件无效。'}
+    $request=[IO.File]::ReadAllText($file,[Text.Encoding]::UTF8) | ConvertFrom-Json
+    $now=[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if($request.version -ne 1 -or $request.status -ne 'pending' -or [long]$request.expires_at -lt $now -or [long]$request.expires_at -gt ($now+600)){throw '下载解锁请求已取消或过期。'}
+    $request.root=[FolderLock.VaultEngine]::Normalize([string]$request.root)
+    if(-not(Test-Path -LiteralPath ($request.root+'.folderlock\portal.json'))){throw '下载目标不是已登记的原路径保险箱。'}
+    return $request
+}
+function Complete-DownloadUnlock([string]$state,[string]$message='') {
+    if(-not $script:downloadUnlockRequest){return}
+    $file=$script:downloadUnlockRequest
+    $script:downloadUnlockRequest=$null
+    $request=[IO.File]::ReadAllText($file,[Text.Encoding]::UTF8) | ConvertFrom-Json
+    if($request.status -ne 'pending'){return}
+    $request.status=$state
+    $request | Add-Member -NotePropertyName message -NotePropertyValue $message -Force
+    $temporary=$file+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
+    try {
+        [IO.File]::WriteAllText($temporary,($request | ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+        [IO.File]::Replace($temporary,$file,[System.Management.Automation.Language.NullString]::Value)
+    } finally {if([IO.File]::Exists($temporary)){[IO.File]::Delete($temporary)}}
 }
 if ($LibraryOnly) { return }
 if(-not $LauncherPath) {
@@ -86,14 +113,17 @@ if($RestoreEntries) {
     return
 }
 $script:requestDirectory=Join-Path $PSScriptRoot 'open-requests'
-function Queue-Open([string]$path, [switch]$Encrypt) {
+function Queue-Open([string]$path, [switch]$Encrypt, [switch]$DownloadUnlock) {
     [void][IO.Directory]::CreateDirectory($script:requestDirectory)
-    $request=Join-Path $script:requestDirectory ([guid]::NewGuid().ToString('N')+$(if($Encrypt){'.encrypt.request'}else{'.request'}))
+    $request=Join-Path $script:requestDirectory ([guid]::NewGuid().ToString('N')+$(if($Encrypt){'.encrypt.request'}elseif($DownloadUnlock){'.unlock.request'}else{'.request'}))
     [IO.File]::WriteAllText(($request+'.new'),$path,[Text.UTF8Encoding]::new($false)); [IO.File]::Move(($request+'.new'),$request)
 }
 $created=$false
 $script:uiMutex=[Threading.Mutex]::new($true,('Local\FolderLock2UI-'+[Security.Principal.WindowsIdentity]::GetCurrent().User.Value),[ref]$created)
-if(-not $created) {if($EncryptPath){Queue-Open $EncryptPath -Encrypt}else{Queue-Open $OpenPath}; $script:uiMutex.Dispose(); return}
+if(-not $created) {if($UnlockRequestPath){Queue-Open $UnlockRequestPath -DownloadUnlock}elseif($EncryptPath){Queue-Open $EncryptPath -Encrypt}else{Queue-Open $OpenPath}; $script:uiMutex.Dispose(); return}
+$script:downloadUnlockRequest=$null
+$script:downloadUnlockProtocol=Join-Path $PSScriptRoot 'download-unlock-v1.pid'
+[IO.File]::WriteAllText($script:downloadUnlockProtocol,[string]$PID)
 $script:mounts = @{}; $script:job = $null; $script:pending = $null; $script:engine = $null
 $script:lockWork = $null; $script:closeRequested = $false
 $script:openWork = $null
@@ -195,15 +225,26 @@ $unlock = Button '解锁并打开（可读写）' 310 334 190 {
     $script:prompting=$true
     try {
         $root = Current-Path
-        if ($script:mounts.ContainsKey($root)) { Start-Process explorer.exe -ArgumentList ($script:mounts[$root].Drive + '\'); return }
+        if ($script:mounts.ContainsKey($root)) {
+            if($script:downloadUnlockRequest){Complete-DownloadUnlock 'ready'}else{Start-Process explorer.exe -ArgumentList ($script:mounts[$root].Drive + '\')}
+            return
+        }
         if (-not (Test-WinFsp)) { throw '未安装 WinFsp，请点击“准备挂载组件”。' }
-        $password = Read-Password '输入此目录的加密密码'
-        if ($null -eq $password) { return }
+        $password = Read-Password $(if($script:downloadUnlockRequest){'下载器请求保存：请输入此目录密码'}else{'输入此目录的加密密码'})
+        if ($null -eq $password) { Complete-DownloadUnlock 'cancelled' '已取消解锁，下载数据保留。'; return }
+        if($script:downloadUnlockRequest){[void](Read-DownloadUnlockRequest $script:downloadUnlockRequest)}
         if($drive.SelectedItem -eq '原路径') {$script:openWork=(Get-Engine).BeginOpenOriginal($root,$password,$LauncherPath)}
         else {$script:openWork = (Get-Engine).BeginOpen($root, $password, [string]$drive.SelectedItem)}
         $script:pendingRoot = $root; $script:pendingAt = Get-Date; $password = $null
         $status.Text = '正在挂载…'; Set-Busy $true
-    } catch { Show-Error $_.Exception.Message } finally {$script:prompting=$false}
+    } catch { Complete-DownloadUnlock 'error' $_.Exception.Message; Show-Error $_.Exception.Message } finally {$script:prompting=$false}
+}
+function Start-DownloadUnlock([string]$file) {
+    $request=Read-DownloadUnlockRequest $file
+    $script:downloadUnlockRequest=[IO.Path]::GetFullPath($file)
+    $pathBox.Text=$request.root;$drive.SelectedIndex=0
+    $form.WindowState='Normal';$form.Show();[void]$form.Activate()
+    $unlock.PerformClick()
 }
 function Lock-All {
     if ($script:lockWork -or $script:mounts.Count -eq 0) { return }
@@ -280,7 +321,8 @@ $timer.Add_Tick({
             if (Test-Path ($script:pending.Drive + '\')) {
                 $script:mounts[$script:pendingRoot] = $script:pending; $script:pending = $null
                 Add-History $script:pendingRoot; Enable-EntryRecovery; Set-Busy $false; Refresh-List
-                Start-Process explorer.exe -ArgumentList ($script:mounts[$script:pendingRoot].Drive + '\'); $status.Text = '已解锁，可读写；使用“安全锁定”提交修改并清理写缓存。'
+                if($script:downloadUnlockRequest){Complete-DownloadUnlock 'ready'}else{Start-Process explorer.exe -ArgumentList ($script:mounts[$script:pendingRoot].Drive + '\')}
+                $status.Text = '已解锁，可读写；使用“安全锁定”提交修改并清理写缓存。'
             } elseif (((Get-Date) - $script:pendingAt).TotalSeconds -gt 30) {
                 $script:pending.Abort(); $script:pending = $null; Set-Busy $false; throw '挂载超时，请检查 WinFsp 和盘符。'
             }
@@ -307,14 +349,14 @@ $timer.Add_Tick({
             if($request) {
                 $target=[IO.File]::ReadAllText($request.FullName,[Text.Encoding]::UTF8); [IO.File]::Delete($request.FullName)
                 $form.WindowState='Normal'; $form.Show(); [void]$form.Activate()
-                if($target){$pathBox.Text=$target; $drive.SelectedIndex=0; if($request.Name.EndsWith('.encrypt.request')){$encrypt.PerformClick()}else{$unlock.PerformClick()}}
+                if($target){if($request.Name.EndsWith('.unlock.request')){Start-DownloadUnlock $target}else{$pathBox.Text=$target; $drive.SelectedIndex=0; if($request.Name.EndsWith('.encrypt.request')){$encrypt.PerformClick()}else{$unlock.PerformClick()}}}
             }
         }
         foreach ($event in @(Get-Event -SourceIdentifier FolderLock2.Session -ErrorAction SilentlyContinue)) {
             if ($event.SourceEventArgs.Reason -eq [Microsoft.Win32.SessionSwitchReason]::SessionLock) { Lock-All }
             Remove-Event -EventIdentifier $event.EventIdentifier
         }
-    } catch { Show-Error $_.Exception.Message }
+    } catch { Complete-DownloadUnlock 'error' $_.Exception.Message; Show-Error $_.Exception.Message }
 })
 $form.Add_FormClosing({ param($sender, $eventArgs)
     if ($script:job) { $script:job.CancelRequested = $true; $eventArgs.Cancel = $true; $status.Text = '正在安全暂停转换。完成后可关闭。' }
@@ -324,7 +366,7 @@ $form.Add_FormClosing({ param($sender, $eventArgs)
 })
 if ($OpenPath) { $pathBox.Text = $OpenPath }
 if ($EncryptPath) { $pathBox.Text = $EncryptPath }
-$form.Add_Shown({if($EncryptPath){$encrypt.PerformClick()}elseif($OpenPath){$drive.SelectedIndex=0; $unlock.PerformClick()}})
+$form.Add_Shown({if($UnlockRequestPath){try{Start-DownloadUnlock $UnlockRequestPath}catch{Show-Error $_.Exception.Message}}elseif($EncryptPath){$encrypt.PerformClick()}elseif($OpenPath){$drive.SelectedIndex=0; $unlock.PerformClick()}})
 try {
     Register-ObjectEvent -InputObject ([Microsoft.Win32.SystemEvents]) -EventName SessionSwitch -SourceIdentifier FolderLock2.Session | Out-Null
     if($script:paths.Count) {
@@ -334,6 +376,8 @@ try {
     Enable-ContextMenu;
     Refresh-List; $timer.Start(); [void]$form.ShowDialog()
 } finally {
+    Complete-DownloadUnlock 'cancelled' 'FolderLock 已关闭；下载数据保留。'
+    if([IO.File]::Exists($script:downloadUnlockProtocol) -and [IO.File]::ReadAllText($script:downloadUnlockProtocol) -eq [string]$PID){[IO.File]::Delete($script:downloadUnlockProtocol)}
     $timer.Stop(); $timer.Dispose(); Unregister-Event -SourceIdentifier FolderLock2.Session -ErrorAction SilentlyContinue
     if ($script:pending) { $script:pending.Abort() }
     foreach ($mount in @($script:mounts.Values)) { $mount.Abort() }

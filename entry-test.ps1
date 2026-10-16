@@ -27,7 +27,13 @@ try {
     if($method.Invoke($null,$arguments) -ne 0){throw 'Encrypt forwarding failed'}
     $encryptRequests=@(Get-ChildItem (Join-Path $base 'FolderLock\app-v2\open-requests') -Filter '*.encrypt.request' -File)
     if($encryptRequests.Count -ne 1 -or [IO.File]::ReadAllText($encryptRequests[0].FullName) -cne $target){throw 'Encrypt action or path lost'}
-    'PASS: compiled launcher forwards exact shortcut path to existing UI without starting a second app'
+    [IO.File]::WriteAllText((Join-Path $base 'FolderLock\app-v2\download-unlock-v1.pid'),[string]$PID)
+    $unlockFile=Join-Path $base 'unlock-request.json'
+    $arguments[0]=[string[]]@('--unlock-request',$unlockFile)
+    if($method.Invoke($null,$arguments) -ne 0){throw 'Download unlock forwarding failed'}
+    $unlockRequests=@(Get-ChildItem (Join-Path $base 'FolderLock\app-v2\open-requests') -Filter '*.unlock.request' -File)
+    if($unlockRequests.Count -ne 1 -or [IO.File]::ReadAllText($unlockRequests[0].FullName) -cne $unlockFile){throw 'Download unlock request path lost'}
+    'PASS: compiled launcher forwards open/encrypt/download unlock requests without starting a second app'
 } finally {
     if($mutex){$mutex.ReleaseMutex();$mutex.Dispose()}
     $full=[IO.Path]::GetFullPath($base)

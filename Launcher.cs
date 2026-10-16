@@ -29,14 +29,16 @@ internal static class Launcher
             string openPath = "";
             bool restore = args.Length == 1 && args[0] == "--restore-entries";
             if (args.Length != 0 && !restore) {
-                if (args.Length != 2 || (args[0] != "--open" && args[0] != "--encrypt")) throw new ArgumentException("用法：FolderLock.exe --open 或 --encrypt 文件夹路径");
+                if (args.Length != 2 || (args[0] != "--open" && args[0] != "--encrypt" && args[0] != "--unlock-request")) throw new ArgumentException("用法：FolderLock.exe --open 或 --encrypt 文件夹路径，或 --unlock-request 请求文件");
                 openPath = Path.GetFullPath(args[1]).TrimEnd('\\');
             }
             try {
                 using (var running = Mutex.OpenExisting("Local\\FolderLock2UI-" + WindowsIdentity.GetCurrent().User.Value)) {
                     if (restore) return 0;
+                    if (args.Length == 2 && args[0] == "--unlock-request" && !File.Exists(Path.Combine(appDirectory, "download-unlock-v1.pid")))
+                        throw new InvalidOperationException("FolderLock 正在运行旧版本。请先安全锁定并退出，再启动新版以接收下载导入请求。");
                     string requests = Path.Combine(appDirectory, "open-requests"); Directory.CreateDirectory(requests);
-                    string request = Path.Combine(requests, Guid.NewGuid().ToString("N") + (args.Length == 2 && args[0] == "--encrypt" ? ".encrypt.request" : ".request"));
+                    string request = Path.Combine(requests, Guid.NewGuid().ToString("N") + (args.Length == 2 && args[0] == "--encrypt" ? ".encrypt.request" : args.Length == 2 && args[0] == "--unlock-request" ? ".unlock.request" : ".request"));
                     File.WriteAllText(request + ".new", openPath, new UTF8Encoding(false)); File.Move(request + ".new", request);
                     return 0;
                 }
@@ -60,7 +62,7 @@ internal static class Launcher
 
             var process = new ProcessStartInfo(powershell)
             {
-                Arguments = "-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File " + Quote(scriptPath) + " -RclonePath " + Quote(rclone) + " -LauncherPath " + Quote(Assembly.GetExecutingAssembly().Location) + (restore ? " -RestoreEntries" : openPath.Length == 0 ? "" : (args[0] == "--encrypt" ? " -EncryptPath " : " -OpenPath ") + Quote(openPath)),
+                Arguments = "-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File " + Quote(scriptPath) + " -RclonePath " + Quote(rclone) + " -LauncherPath " + Quote(Assembly.GetExecutingAssembly().Location) + (restore ? " -RestoreEntries" : openPath.Length == 0 ? "" : (args[0] == "--encrypt" ? " -EncryptPath " : args[0] == "--unlock-request" ? " -UnlockRequestPath " : " -OpenPath ") + Quote(openPath)),
                 WorkingDirectory = appDirectory,
                 UseShellExecute = false,
                 CreateNoWindow = true,
